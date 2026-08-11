@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 )
@@ -54,5 +55,55 @@ func TestPumpBlankLines(t *testing.T) {
 	pump(strings.NewReader("\r\n\r\nabc\r\n"), &out, f)
 	if n := strings.Count(out.String(), "\n"); n != 3 {
 		t.Errorf("开头两个空行应保留，期望 3 个换行实际 %d: %q", n, out.String())
+	}
+}
+
+// slowReader 模拟涓流：每次只给一小段，中间断流——正是打字回显的样子。
+type slowReader struct {
+	chunks [][]byte
+	i      int
+}
+
+func (s *slowReader) Read(p []byte) (int, error) {
+	if s.i >= len(s.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.chunks[s.i])
+	s.i++
+	return n, nil
+}
+
+// TestPumpPartialLineEchoes 半行必须立刻可见。
+// 打字回显、光标定位、输入框重画都不带 \n，攒着不发 = 界面完全冻住
+// （用户实测：打字看不见、回车没反应、但命令其实在跑）。
+func TestPumpPartialLineEchoes(t *testing.T) {
+	var out bytes.Buffer
+	src := &slowReader{chunks: [][]byte{[]byte("h"), []byte("e"), []byte("llo")}}
+	pump(src, &out, newFilter(mustRules(t), 100))
+	if got := out.String(); got != "hello" {
+		t.Errorf("涓流输入应原样立刻透出，得到 %q", got)
+	}
+}
+
+// TestPumpPartialThenNewline 前缀已经吐过之后，行尾只补剩下的，不能重复也不能再过滤。
+func TestPumpPartialThenNewline(t *testing.T) {
+	var out bytes.Buffer
+	src := &slowReader{chunks: [][]byte{[]byte("⏺ Bash(ls)"), []byte("\r\n")}}
+	pump(src, &out, newFilter(mustRules(t), 100))
+	got := ansi.ReplaceAllString(out.String(), "")
+	if strings.Count(got, "Bash") != 1 {
+		t.Errorf("前缀已输出，不该重复或吞掉，得到 %q", got)
+	}
+}
+
+// TestPumpBatchStillFilters 成批到达（滚动历史、工具块）仍然要正常折叠。
+func TestPumpBatchStillFilters(t *testing.T) {
+	in := "⏺ Bash(ls -la)\r\n  ⎿ total 8\r\n    … +78 lines (ctrl+o to expand)\r\n⏺ 正文\r\n"
+	var out bytes.Buffer
+	f := newFilter(mustRules(t), 100)
+	pump(strings.NewReader(in), &out, f)
+	got := ansi.ReplaceAllString(out.String(), "")
+	if f.Hits == 0 || strings.Contains(got, "+78 lines") {
+		t.Errorf("整批到达时该照常折叠，Hits=%d 输出 %q", f.Hits, got)
 	}
 }

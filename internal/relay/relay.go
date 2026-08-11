@@ -81,10 +81,22 @@ func pump(src io.Reader, dst io.Writer, f *Filter) {
 	w := bufio.NewWriterSize(dst, 64*1024)
 	defer w.Flush()
 	line := make([]byte, 0, 4096) // 非 nil：Filter 用 nil 表示「这行不显示」，空行不能跟它混淆
+	partial := false              // 当前这半行的前缀已经原样吐出去了，行尾到了不能再过滤
 	for {
 		if r.Buffered() == 0 {
-			// 手上的字节处理完了，把攒的输出推给终端再去阻塞读下一批。
-			// 这个时机保证「延迟只来自等数据，不来自等缓冲」，交互手感不受影响。
+			// 数据断流了。手上这半行**可能永远等不到行尾**——输入回显、光标定位、
+			// 输入框重画都不带 \n。攒着不发就是「打字看不见、回车没反应」。
+			// 所以先原样吐出去保证交互，代价是这行放弃过滤（partial 记下来）。
+			//
+			// 好在成批到达的内容（滚动历史、工具块）几乎总是整行落在同一次缓冲填充里，
+			// 该折叠的照样折叠；只有涓流式的交互回显走这条不过滤的快路。
+			if len(line) > 0 {
+				_, _ = w.Write(line)
+				line = line[:0]
+				partial = true
+			}
+			// 再把攒的输出推给终端才去阻塞读下一批：
+			// 延迟只来自等数据，不来自等缓冲。
 			_ = w.Flush()
 		}
 		b, err := r.ReadByte()
@@ -96,7 +108,10 @@ func pump(src io.Reader, dst io.Writer, f *Filter) {
 		}
 		switch b {
 		case '\n':
-			if out := f.Line(line); out != nil {
+			if partial {
+				_, _ = w.Write(append(line, '\r', '\n')) // 前缀已出，补完剩下的，不过滤
+				partial = false
+			} else if out := f.Line(line); out != nil {
 				_, _ = w.Write(append(out, '\r', '\n'))
 			}
 			line = line[:0]
@@ -116,6 +131,7 @@ func pump(src io.Reader, dst io.Writer, f *Filter) {
 			}
 			_, _ = w.Write(append(line, '\r'))
 			line = line[:0]
+			partial = false
 		default:
 			line = append(line, b)
 		}
