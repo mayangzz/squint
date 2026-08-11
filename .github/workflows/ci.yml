@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -race
+      # 折叠规则是数据不是代码，坏了编译不报错——单独校验一次，别等用户发现没生效
+      - run: go run . --check
