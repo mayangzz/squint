@@ -38,7 +38,11 @@ func main() {
 	flag.Parse()
 
 	if *check {
+		// `squint --check <capture>` 重放一份真实抓包；不给文件就拿内置样本自检。
 		report, ok := relay.Check()
+		if f := flag.Arg(0); f != "" {
+			report, ok = relay.CheckCapture(f)
+		}
 		fmt.Print(report)
 		if !ok {
 			os.Exit(1)

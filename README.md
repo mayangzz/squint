@@ -212,7 +212,7 @@ Flags override the file.
 
 Two pluggable axes meeting at one normalized `Event`: **sources** decide where events come from, **lenses** decide what you see. Adding a backend touches no lens; adding a lens touches no backend.
 
-Relay mode is feasible because Claude Code uses the classic main-screen renderer — no alternate screen, no `[2J`, no cursor addressing. Output is appended line by line, so a line filter is enough; no terminal emulator required.
+Relay mode is feasible because Claude Code uses the classic main-screen renderer — no alternate screen, no `[2J`. Committed output is appended line by line, so a line filter is enough; no terminal emulator required. It does use cursor addressing (`\x1b[<n>G` to place words, `\x1b[<n>A` to repaint the live region), which is why squint reconstructs column positions before matching and leaves the live region alone.
 
 ```
 internal/event    normalized Event
@@ -229,7 +229,7 @@ MVP, and honest about it.
 
 **Headless mode is solid.** Sources, lenses, `--save`/`--replay` all work and are covered by tests.
 
-**Relay mode has a known gap.** It splits on `\n`, and a PTY delivers finished lines as `\r\n` (handled). But Claude Code also redraws its *in-progress* tool block in place using bare `\r` — those fragments pass through unfiltered by design, because buffering them would freeze your cursor and echo. You get collapsing on committed scrollback and raw output on the live region. Short tasks may see little effect.
+**Relay mode has a known gap.** Claude Code redraws its *in-progress* region — input box, spinner, the tool block still running — by moving the cursor up (`\x1b[nA`) and repainting. squint cannot collapse those lines: collapsing changes how many lines there are, and the next repaint would land on the wrong ones. So you get collapsing on committed scrollback and raw output on the live region. Short tasks may see little effect.
 
 If nothing gets collapsed at all, squint says so on exit rather than pretending to work:
 
@@ -238,7 +238,15 @@ squint: saw 412 lines and collapsed nothing — rule set "claude-code"
 may not match this agent version. Run `squint --check`.
 ```
 
-> **A warning for anyone editing rules.** Claude Code draws tool headers with `⏺` (U+23FA) and continuations with `⎿` (U+23BF). On screen they read as `●` and `└`. Transcribing them by eye produces a regex that matches nothing — and fails *silently*, because the display still looks fine. Capture real bytes from a PTY before changing these. Both of this project's worst bugs were exactly this mistake.
+> **A warning for anyone editing rules.** Three things about this output are invisible on screen, and getting any of them wrong makes the rules match nothing — *silently*, because the display still looks fine:
+>
+> | | On screen | In the bytes |
+> |---|---|---|
+> | markers | `●` and `└` | `⏺` U+23FA and `⎿` U+23BF |
+> | line ending | a new line | `\r\r\n` (the child writes `\r\n`, then ONLCR expands the `\n`) |
+> | word spacing | spaces | no space bytes at all — `\x1b[<n>G` column jumps |
+>
+> Capture real bytes before changing these. Every bad bug in this project was one of these three, and the unit tests stayed green each time because the fixtures were transcribed from the screen too.
 
 Builds clean for darwin, linux and windows. `--relay` is Unix-only (no PTY on Windows); headless mode works everywhere.
 
@@ -256,9 +264,18 @@ For anything that feels wrong in relay mode — laggy, frozen, something swallow
 
 ```bash
 SQUINT_CAPTURE=/tmp/squint.raw claude    # or however you invoke it
+squint --check /tmp/squint.raw           # replay it through the rules
 ```
 
-Those bytes replay offline against the filter, which is far more useful than a screenshot. Both of this project's worst bugs were found that way, and neither was visible from the rendered output.
+`--check <capture>` tells you which layer is broken:
+
+| Output | Means |
+|---|---|
+| `no line ever formed` | line-ending detection is wrong for this agent |
+| `most output never reached the filter` | a squint bug, not your rules |
+| `lines formed but no rule matched` | the rule set doesn't fit this agent |
+
+Attach the capture to the issue. Every serious bug in this project was invisible from the rendered output and obvious from the bytes — line endings turned out to be `\r\r\n`, and words are positioned with `\x1b[<n>G` rather than separated by spaces. A screenshot shows neither.
 
 ## License
 

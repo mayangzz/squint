@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestPumpCRLF 锁住最要命的那个 bug：PTY 默认 ONLCR，行尾是 \r\n 不是 \n。
@@ -73,26 +74,75 @@ func (s *slowReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestPumpPartialLineEchoes 半行必须立刻可见。
-// 打字回显、光标定位、输入框重画都不带 \n，攒着不发 = 界面完全冻住
-// （用户实测：打字看不见、回车没反应、但命令其实在跑）。
-func TestPumpPartialLineEchoes(t *testing.T) {
+// blockingReader 在给下一段之前先卡住，模拟真实的断流：人在打字、agent 在思考。
+type blockingReader struct {
+	chunks [][]byte
+	i      int
+	delay  time.Duration
+}
+
+func (b *blockingReader) Read(p []byte) (int, error) {
+	if b.i >= len(b.chunks) {
+		return 0, io.EOF
+	}
+	if b.i > 0 {
+		time.Sleep(b.delay)
+	}
+	n := copy(p, b.chunks[b.i])
+	b.i++
+	return n, nil
+}
+
+// chanWriter 把每次写送进 channel，用来断言「什么时候」看到的，而不只是「有没有」。
+type chanWriter struct{ ch chan string }
+
+func (c *chanWriter) Write(p []byte) (int, error) { c.ch <- string(p); return len(p), nil }
+
+// TestPumpSplitLineStillFilters 锁住本次修的 bug：一次 read 切在行中间是常态
+// （PTY 读多少字节由内核缓冲决定，跟行边界毫无关系）。旧实现把这种切分当成断流，
+// 于是几乎每一行都走了「放弃过滤」的快路——界面看着完全正常，只是什么都没折叠。
+func TestPumpSplitLineStillFilters(t *testing.T) {
+	src := &slowReader{chunks: [][]byte{
+		[]byte("⏺ Bash("), []byte("ls -la)\r\n  ⎿ tot"), []byte("al 8\r\n"),
+	}}
 	var out bytes.Buffer
-	src := &slowReader{chunks: [][]byte{[]byte("h"), []byte("e"), []byte("llo")}}
-	pump(src, &out, newFilter(mustRules(t), 100))
-	if got := out.String(); got != "hello" {
-		t.Errorf("涓流输入应原样立刻透出，得到 %q", got)
+	f := newFilter(mustRules(t), 100)
+	pump(src, &out, f)
+	got := ansi.ReplaceAllString(out.String(), "")
+
+	if f.Hits == 0 {
+		t.Fatalf("切在行中间也该照常折叠，输出 %q", got)
+	}
+	if strings.Contains(got, "total 8") {
+		t.Errorf("续行没折叠掉: %q", got)
+	}
+	if f.Partials != 0 {
+		t.Errorf("字节是连着来的，不算断流，不该产生半行，实际 %d", f.Partials)
 	}
 }
 
-// TestPumpPartialThenNewline 前缀已经吐过之后，行尾只补剩下的，不能重复也不能再过滤。
-func TestPumpPartialThenNewline(t *testing.T) {
-	var out bytes.Buffer
-	src := &slowReader{chunks: [][]byte{[]byte("⏺ Bash(ls)"), []byte("\r\n")}}
-	pump(src, &out, newFilter(mustRules(t), 100))
-	got := ansi.ReplaceAllString(out.String(), "")
-	if strings.Count(got, "Bash") != 1 {
-		t.Errorf("前缀已输出，不该重复或吞掉，得到 %q", got)
+// TestPumpStalledPartialStaysInstant 另一头：真断流时半行必须立刻可见。
+// 打字回显、光标定位、输入框重画都不带行尾，攒着不发 = 界面完全冻住
+// （用户实测：打字看不见、回车没反应、但命令其实在跑）。
+func TestPumpStalledPartialStaysInstant(t *testing.T) {
+	src := &blockingReader{
+		chunks: [][]byte{[]byte("⏺ Bash(ls)"), []byte("\r\n")},
+		delay:  500 * time.Millisecond,
+	}
+	w := &chanWriter{ch: make(chan string, 8)}
+	f := newFilter(mustRules(t), 100)
+	go pump(src, w, f)
+
+	select {
+	case got := <-w.ch:
+		if !strings.Contains(got, "Bash(ls)") {
+			t.Fatalf("断流时半行应原样立刻透出，得到 %q", got)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("断流后迟迟没有输出——界面会冻住")
+	}
+	if got := <-w.ch; got != "\r\n" {
+		t.Errorf("前缀已输出，行尾只该补剩下的，得到 %q", got)
 	}
 }
 

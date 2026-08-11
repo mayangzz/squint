@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/creack/pty"
 	"golang.org/x/term"
@@ -31,6 +32,10 @@ func Run(name string, args []string) (int, error) {
 	defer ptmx.Close()
 
 	f := &Filter{Rules: rules}
+	if path := os.Getenv("SQUINT_DEBUG"); path != "" {
+		f.Debug = OpenDebug(path)
+		defer f.Debug.Close(f)
+	}
 	stopResize := watchResize(ptmx, f)
 	defer stopResize()
 
@@ -83,71 +88,132 @@ func Run(name string, args []string) (int, error) {
 	return 0, nil
 }
 
+// settleDelay 是「这半行还会不会补齐」的等待窗口。
+//
+// 拿捏两头：等太短，一次 read 切在行中间就把这行判成半行、放弃过滤（旧版本就是
+// 这么把过滤器架空的——PTY 一次读多少字节由内核缓冲决定，跟行边界毫无关系）；
+// 等太长，输入回显和光标定位会滞后，手感发飘。几毫秒人眼无感，而真正的「断流」
+// （agent 在思考、在等你打字）远不止几毫秒，两者分得干净。
+var settleDelay = 4 * time.Millisecond
+
 // pump 按行读 PTY 输出，过滤后写出去。
 //
-// 注意：TUI 的输入框/spinner 是靠 \r 原地重画的，那部分不能按行缓冲——否则光标
-// 和输入回显会卡住。所以只有遇到 \n 才成行送进过滤器，裸 \r 片段直接透传。
+// 难点在于「一行读完了」和「这一批字节读完了」是两回事。TUI 的输入框和 spinner
+// 靠裸 \r 原地重画，永远等不到 \n，攒着不发就是打字看不见、回车没反应；而工具块
+// 是正常的整行，必须成行才能过滤。read 的切分点跟这两者都无关。
+//
+// 解法：只在**真的没有后续字节**时才放弃过滤。读放在单独 goroutine 里，主循环
+// 拿到一批就处理，剩下半行时起一个 settleDelay 的表——表响之前又来字节就接着攒，
+// 表响了才原样吐出去。
 func pump(src io.Reader, dst io.Writer, f *Filter) {
-	r := bufio.NewReaderSize(src, 64*1024)
+	chunks := make(chan []byte, 64)
+	go func() {
+		defer close(chunks)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				c := make([]byte, n)
+				copy(c, buf[:n])
+				chunks <- c
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	// 输出也要缓冲。TUI 一次 write 出来的重绘帧里有几十个 \r 片段，逐片直写终端
 	// 就是几十次 syscall——原生 claude 是一次写完的，拆开之后手感明显发卡。
-	// 攒着，等这一批字节读干净了再一次性 flush（见下面的 Buffered()==0）。
 	w := bufio.NewWriterSize(dst, 64*1024)
 	defer w.Flush()
+
 	line := make([]byte, 0, 4096) // 非 nil：Filter 用 nil 表示「这行不显示」，空行不能跟它混淆
-	partial := false              // 当前这半行的前缀已经原样吐出去了，行尾到了不能再过滤
+	partial := false              // 这半行的前缀已经原样吐出去了，行尾到了不能再过滤
+	crs := 0                      // 攒着的连续 \r，还不知道是行尾还是原地重画
+
+	endLine := func() {
+		crs = 0
+		if partial {
+			_, _ = w.Write(append(line, '\r', '\n')) // 前缀已出，补完剩下的，不过滤
+			partial = false
+		} else if out := f.Line(line); out != nil {
+			_, _ = w.Write(append(out, '\r', '\n'))
+		}
+		line = line[:0]
+	}
+	// flushCR 把确定是「原地重画」的 \r 片段原样发出去。
+	flushCR := func() {
+		for ; crs > 0; crs-- {
+			line = append(line, '\r')
+		}
+		_, _ = w.Write(line)
+		line = line[:0]
+		partial = false
+	}
+
+	process := func(chunk []byte) {
+		for _, b := range chunk {
+			switch {
+			case b == '\r':
+				// 关键：行尾要按**一串** \r 判，不能只看一个。
+				// 子进程自己写 "\r\n"，PTY 的 ONLCR 又把那个 \n 展成 "\r\n"，
+				// 落到 master 端就是 "\r\r\n"（实测 19/20 行如此）。按单个 \r 判的话，
+				// 每一行都会因为「下一个字节不是 \n」被当成原地重画原样放行，
+				// 过滤器全程只收到空行——界面完全正常，只是什么都没折叠。
+				crs++
+			case b == '\n':
+				endLine()
+			default:
+				if crs > 0 {
+					flushCR() // \r 后面接的是正文，那就真是原地重画
+				}
+				line = append(line, b)
+			}
+		}
+	}
+
+	timer := time.NewTimer(settleDelay)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	var settle <-chan time.Time
+
 	for {
-		if r.Buffered() == 0 {
-			// 数据断流了。手上这半行**可能永远等不到行尾**——输入回显、光标定位、
-			// 输入框重画都不带 \n。攒着不发就是「打字看不见、回车没反应」。
-			// 所以先原样吐出去保证交互，代价是这行放弃过滤（partial 记下来）。
-			//
-			// 好在成批到达的内容（滚动历史、工具块）几乎总是整行落在同一次缓冲填充里，
-			// 该折叠的照样折叠；只有涓流式的交互回显走这条不过滤的快路。
-			if len(line) > 0 {
+		select {
+		case c, ok := <-chunks:
+			if !ok {
+				if crs > 0 {
+					flushCR()
+				} else if len(line) > 0 {
+					_, _ = w.Write(line)
+				}
+				return
+			}
+			process(c)
+			if len(line) > 0 || crs > 0 {
+				timer.Reset(settleDelay)
+				settle = timer.C
+			} else {
+				settle = nil
+			}
+			_ = w.Flush() // 先把攒的推给终端再回去等，延迟只来自等数据
+
+		case <-settle:
+			// 等窗口到了还没有后续字节：这是真的断流（输入回显、光标定位、
+			// 输入框重画都不带行尾）。原样吐出去保交互，代价是这行放弃过滤。
+			settle = nil
+			switch {
+			case crs > 0:
+				flushCR()
+			case len(line) > 0:
+				f.notePartial(line)
 				_, _ = w.Write(line)
 				line = line[:0]
 				partial = true
 			}
-			// 再把攒的输出推给终端才去阻塞读下一批：
-			// 延迟只来自等数据，不来自等缓冲。
 			_ = w.Flush()
-		}
-		b, err := r.ReadByte()
-		if err != nil {
-			if len(line) > 0 {
-				_, _ = w.Write(line)
-			}
-			return
-		}
-		switch b {
-		case '\n':
-			if partial {
-				_, _ = w.Write(append(line, '\r', '\n')) // 前缀已出，补完剩下的，不过滤
-				partial = false
-			} else if out := f.Line(line); out != nil {
-				_, _ = w.Write(append(out, '\r', '\n'))
-			}
-			line = line[:0]
-		case '\r':
-			// PTY 默认开 ONLCR：子进程写 "\n"，master 端读到 "\r\n"。实测真实会话
-			// 2067 个 CRLF、0 个裸 LF —— 也就是说**每一行**都会先撞到这里。
-			// 早期版本在这里直接透传，等于过滤器全程空转（HealthWarning 也不响，
-			// 因为 Lines 只在 '\n' 分支自增）。所以必须先分清是行尾还是原地重画。
-			//
-			// 只在缓冲区已有字节时 Peek：Peek 会阻塞等下一个字节，spinner 打完
-			// "...\r" 停顿时会把重画片段扣住不输出，交互回显直接卡死。
-			// ONLCR 的 \r\n 是同一次 write 产生的，绝大多数落在同一次缓冲填充里。
-			if r.Buffered() > 0 {
-				if nb, _ := r.Peek(1); len(nb) > 0 && nb[0] == '\n' {
-					continue // 行尾，交给 '\n' 分支按行过滤
-				}
-			}
-			_, _ = w.Write(append(line, '\r'))
-			line = line[:0]
-			partial = false
-		default:
-			line = append(line, b)
 		}
 	}
 }
