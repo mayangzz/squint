@@ -252,6 +252,14 @@ Issues and PRs welcome — especially:
 
 If a rule stops matching after an agent update, that's a bug worth reporting even without a fix; `squint --check` output is the useful thing to paste.
 
+For anything that feels wrong in relay mode — laggy, frozen, something swallowed — capture the raw stream instead of describing it:
+
+```bash
+SQUINT_CAPTURE=/tmp/squint.raw claude    # or however you invoke it
+```
+
+Those bytes replay offline against the filter, which is far more useful than a screenshot. Both of this project's worst bugs were found that way, and neither was visible from the rendered output.
+
 ## License
 
 MIT

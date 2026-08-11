@@ -51,7 +51,21 @@ func Run(name string, args []string) (int, error) {
 	defer stopDeath()
 
 	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
-	pump(ptmx, os.Stdout, f)
+
+	// SQUINT_CAPTURE=/path 时把 PTY 原始字节另存一份。
+	// 「感觉卡」「好像吞了东西」这类问题光靠描述查不动——有了原始字节就能离线复现，
+	// 直接喂给 pump 的测试跑，不用反复占用真实会话。
+	var out io.Reader = ptmx
+	if path := os.Getenv("SQUINT_CAPTURE"); path != "" {
+		if cf, err := os.Create(path); err == nil {
+			defer cf.Close()
+			out = io.TeeReader(ptmx, cf)
+			fmt.Fprintf(os.Stderr, "squint: capturing raw PTY bytes to %s\r\n", path)
+		} else {
+			fmt.Fprintf(os.Stderr, "squint: cannot capture to %s: %v\r\n", path, err)
+		}
+	}
+	pump(out, os.Stdout, f)
 
 	// 规则静默失效是这类工具最阴的失败模式：界面看着正常，只是什么都没折叠。
 	// 这个 defer 注册在 restore 之后，LIFO 下先于 restore 执行，也就是仍在 raw 模式里
