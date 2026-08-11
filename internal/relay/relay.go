@@ -75,19 +75,29 @@ func Run(name string, args []string) (int, error) {
 // 和输入回显会卡住。所以只有遇到 \n 才成行送进过滤器，裸 \r 片段直接透传。
 func pump(src io.Reader, dst io.Writer, f *Filter) {
 	r := bufio.NewReaderSize(src, 64*1024)
+	// 输出也要缓冲。TUI 一次 write 出来的重绘帧里有几十个 \r 片段，逐片直写终端
+	// 就是几十次 syscall——原生 claude 是一次写完的，拆开之后手感明显发卡。
+	// 攒着，等这一批字节读干净了再一次性 flush（见下面的 Buffered()==0）。
+	w := bufio.NewWriterSize(dst, 64*1024)
+	defer w.Flush()
 	line := make([]byte, 0, 4096) // 非 nil：Filter 用 nil 表示「这行不显示」，空行不能跟它混淆
 	for {
+		if r.Buffered() == 0 {
+			// 手上的字节处理完了，把攒的输出推给终端再去阻塞读下一批。
+			// 这个时机保证「延迟只来自等数据，不来自等缓冲」，交互手感不受影响。
+			_ = w.Flush()
+		}
 		b, err := r.ReadByte()
 		if err != nil {
 			if len(line) > 0 {
-				_, _ = dst.Write(line)
+				_, _ = w.Write(line)
 			}
 			return
 		}
 		switch b {
 		case '\n':
 			if out := f.Line(line); out != nil {
-				_, _ = dst.Write(append(out, '\r', '\n'))
+				_, _ = w.Write(append(out, '\r', '\n'))
 			}
 			line = line[:0]
 		case '\r':
@@ -104,7 +114,7 @@ func pump(src io.Reader, dst io.Writer, f *Filter) {
 					continue // 行尾，交给 '\n' 分支按行过滤
 				}
 			}
-			_, _ = dst.Write(append(line, '\r'))
+			_, _ = w.Write(append(line, '\r'))
 			line = line[:0]
 		default:
 			line = append(line, b)
