@@ -28,8 +28,8 @@ func TestFilterCollapsesToolBlocks(t *testing.T) {
 	f := newFilter(mustRules(t), 100)
 	var out []string
 	for _, line := range strings.Split(sample, "\n") {
-		if b := f.Line([]byte(line)); b != nil {
-			out = append(out, string(b))
+		if d := f.Judge(line); d.Verdict != Drop {
+			out = append(out, d.Text)
 		}
 	}
 	got := strings.Join(out, "\n")
@@ -68,17 +68,17 @@ func mustRules(t *testing.T) *Rules {
 
 // TestHealthWarning 锁住「规则静默失效」的自检：改了 UI 标记之后必须能被发现。
 func TestHealthWarning(t *testing.T) {
-	f := &Filter{Rules: mustRules(t)}
+	f := newFilter(mustRules(t), 100)
 	for i := 0; i < minLinesForHealthCheck+1; i++ {
-		f.Line([]byte("普通输出，什么规则都不命中"))
+		f.Judge("普通输出，什么规则都不命中")
 	}
 	if f.HealthWarning() == "" {
 		t.Error("一次都没折叠过，应该报警")
 	}
-	f2 := &Filter{Rules: mustRules(t)}
-	f2.Line([]byte("⏺ Bash(ls)"))
+	f2 := newFilter(mustRules(t), 100)
+	f2.Judge("⏺ Bash(ls)")
 	for i := 0; i < minLinesForHealthCheck+1; i++ {
-		f2.Line([]byte("正文"))
+		f2.Judge("正文")
 	}
 	if w := f2.HealthWarning(); w != "" {
 		t.Errorf("命中过就不该报警，却报了: %s", w)
@@ -99,7 +99,7 @@ func TestCustomToolFormat(t *testing.T) {
 	}
 	for in, want := range cases {
 		f := newFilter(r, 100)
-		got := ansi.ReplaceAllString(string(f.Line([]byte(in))), "")
+		got := strings.TrimSuffix(strings.TrimPrefix(f.Judge(in).Text, dim), reset)
 		if got != want {
 			t.Errorf("%q\n got: %q\nwant: %q", in, got, want)
 		}
@@ -112,7 +112,7 @@ func TestDedupeRepeats(t *testing.T) {
 	seq := []string{"⏺ Bash(ls)", "⏺ Bash(ls)", "⏺ Bash(ls)", "⏺ Bash(pwd)", "⏺ Bash(pwd)"}
 	shown := 0
 	for _, l := range seq {
-		if f.Line([]byte(l)) != nil {
+		if f.Judge(l).Verdict != Drop {
 			shown++
 		}
 	}
@@ -122,9 +122,32 @@ func TestDedupeRepeats(t *testing.T) {
 
 	f2 := newFilter(mustRules(t), 100)
 	for _, l := range []string{"⏺ Bash(ls)", "中间有正文", "⏺ Bash(ls)"} {
-		f2.Line([]byte(l))
+		f2.Judge(l)
 	}
-	if out := f2.Line([]byte("⏺ Bash(pwd)")); out == nil {
+	if f2.Judge("⏺ Bash(pwd)").Verdict == Drop {
 		t.Error("换了命令不该被压掉")
+	}
+}
+
+// TestHeadDoesNotEatProse 工具名允许带一个空格（Web Search），但不能因此把正文当成工具调用。
+// 放宽匹配最容易出的事故就是这个：agent 说句带括号的话，整段就被折叠没了。
+func TestHeadDoesNotEatProse(t *testing.T) {
+	f := newFilter(mustRules(t), 100)
+	prose := []string{
+		"⏺ Now I will check (the config) before moving on",
+		"⏺ 策略 114 = CensorStrategyUserCheck（个人资料先审后发）",
+		"⏺ done — see service/censor/payload.go:44 (line 44)",
+		"⏺ 这里有个坑(注意)",
+	}
+	for _, p := range prose {
+		if d := f.Judge(p); d.Verdict == Collapse {
+			t.Errorf("正文被当成工具调用折叠了: %q -> %q", p, d.Text)
+		}
+	}
+	// 真的工具调用还得认得出来，包括带空格的那个
+	for _, tool := range []string{"⏺ Bash(ls)", "⏺ Web Search(golang pty)", "⏺ Update(a.go)"} {
+		if d := f.Judge(tool); d.Verdict != Collapse {
+			t.Errorf("没认出工具调用: %q", tool)
+		}
 	}
 }

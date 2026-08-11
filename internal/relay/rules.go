@@ -30,6 +30,9 @@ type Rules struct {
 	// DedupeRepeats 连着重复的同一行只显示一次。agent 反复读同一个文件、
 	// 反复跑同一条命令时，重复提醒没有信息量，只是把屏幕撑满。
 	DedupeRepeats *bool `json:"dedupe_repeats"`
+	// MergeToolRuns 连着调用同一个工具的若干次并成一行，缀上次数。
+	// 一口气跑七条 shell 命令时，七行提示不如一行「在跑 shell，第 7 条」有用。
+	MergeToolRuns *bool `json:"merge_tool_runs"`
 	// Tools 按工具名覆盖 HeadFormat，想写成「🔍 正在查找 {arg}」就写在这里。
 	// 键大小写不敏感，值同样支持 {tool} {arg}。
 	Tools map[string]string `json:"tools"`
@@ -100,6 +103,10 @@ func (r *Rules) compile() error {
 	if r.DedupeRepeats == nil {
 		on := true // 默认开：重复行没信息量
 		r.DedupeRepeats = &on
+	}
+	if r.MergeToolRuns == nil {
+		on := true // 默认开：连着同一个工具，知道它在跑什么就够了
+		r.MergeToolRuns = &on
 	}
 	r.tools = make(map[string]string, len(r.Tools))
 	for k, v := range r.Tools {

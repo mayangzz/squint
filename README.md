@@ -50,7 +50,7 @@ If you live in a terminal and run an agent for hours a day, this is the differen
 go install github.com/mayangzz/squint@latest
 ```
 
-Requires Go 1.24+ and an agent CLI on your `PATH`.
+Requires Go 1.25+ and an agent CLI on your `PATH`.
 
 ---
 
@@ -122,8 +122,17 @@ Don't like `🔍 running`? Every line is a template. Drop a `~/.squint/rules.jso
 | `tools` | per-tool line. Placeholders `{tool}` `{arg}`. Names are case-insensitive |
 | `head_format` | fallback for tools you didn't name |
 | `dedupe_repeats` | consecutive identical lines print once (default `true`) — an agent re-reading the same file five times tells you nothing the second time |
+| `merge_tool_runs` | consecutive calls to the *same tool* become one line with a count (default `true`) — see below |
 | `noise` | lines to drop entirely |
 | `head` | must have two capture groups: tool name, arguments |
+
+**Runs of one tool become one line.** An agent that fires seven `sed` commands in a row produces seven identical-looking status lines that tell you nothing after the first. squint folds them:
+
+```
+🔍 running  sed -n 200,270p service/censor/createcensor.go ×7
+```
+
+The count and the command update in place while the run is live, so the line doubles as a heartbeat — if the number is climbing, it is still working. Set `merge_tool_runs: false` to list every call instead.
 
 Start from the shipped defaults:
 
@@ -173,12 +182,12 @@ Any language. One JSON object in, one line out.
 
 | Agent | Relay (interactive) | Headless |
 |---|---|---|
-| **Claude Code** | ✅ tested against 2.1.227 | ✅ |
+| **Claude Code** | ✅ tested against 2.1.227, with a real session capture in CI | ✅ |
 | Codex | ⚠️ untested | 🚧 stub — command line is right, event mapping isn't |
 | Gemini CLI | ⚠️ untested | 🚧 stub |
 | everything else | — | — |
 
-Relay mode is mostly agent-agnostic: it filters on-screen text, so any agent whose TUI appends lines can work with the right `rules.json` — no code needed. Headless mode needs a `Source` implementation (~80 lines, see `internal/source/claude.go`).
+Relay mode is agent-agnostic: it filters the *reconstructed screen*, so it does not care how the agent paints. Any TUI can work with the right `rules.json` — no code needed. Headless mode needs a `Source` implementation (~80 lines, see `internal/source/claude.go`).
 
 **Using something else — grok, aider, opencode, cursor-agent?** Open an issue with a snippet of its output (or better, a PTY capture) and we'll add a rule set. Adding your agent is usually a JSON file, not a patch.
 
@@ -200,8 +209,8 @@ Flags override the file.
 
 ```
                  ┌──────────────────────────────┐
-  keyboard  ───► │  relay: PTY + line filter    │ ───►  agent (unmodified)
-  terminal  ◄─── │  collapses tool blocks       │ ◄───  raw TUI output
+  keyboard  ───► │  relay: PTY + VT emulator    │ ───►  agent (unmodified)
+  terminal  ◄─── │  filtered repaint            │ ◄───  raw TUI output
                  └──────────────────────────────┘
 
                  ┌──────────┐      ┌───────┐      ┌──────┐
@@ -212,13 +221,18 @@ Flags override the file.
 
 Two pluggable axes meeting at one normalized `Event`: **sources** decide where events come from, **lenses** decide what you see. Adding a backend touches no lens; adding a lens touches no backend.
 
-Relay mode is feasible because Claude Code uses the classic main-screen renderer — no alternate screen, no `[2J`. Committed output is appended line by line, so a line filter is enough; no terminal emulator required. It does use cursor addressing (`\x1b[<n>G` to place words, `\x1b[<n>A` to repaint the live region), which is why squint reconstructs column positions before matching and leaves the live region alone.
+Relay mode runs a real terminal emulator, because there is no shortcut. Claude Code 2.1.227 paints its screen differentially: `\x1b[<n>A` to jump up, `\r\x1b[1B` to step down and patch individual cells, several screen rows packed into a single write, words positioned with `\x1b[<n>G` rather than separated by spaces. A "line" in the byte stream has no relationship to a line on screen — and deleting bytes from that stream corrupts the cursor arithmetic that follows.
+
+So squint replays the output into an emulator, reads the reconstructed screen, and repaints a filtered copy. Two consequences fall out of that:
+
+- **Rows that scroll off are appended once and never touched again**, so your terminal's native scrollback, mouse selection and find all keep working.
+- **The live region can be filtered too.** The child's cursor moves inside the emulator, not on your screen, so squint is free to lay out the visible region however it likes.
 
 ```
 internal/event    normalized Event
 internal/source   agent backends — claude ✓, codex / gemini stubs
 internal/lens     built-ins + external-process plugins
-internal/relay    PTY wrapper + rule-driven line filter
+internal/relay    PTY + terminal emulator + rule-driven screen filter
 ```
 
 ---
@@ -229,7 +243,11 @@ MVP, and honest about it.
 
 **Headless mode is solid.** Sources, lenses, `--save`/`--replay` all work and are covered by tests.
 
-**Relay mode has a known gap.** Claude Code redraws its *in-progress* region — input box, spinner, the tool block still running — by moving the cursor up (`\x1b[nA`) and repainting. squint cannot collapse those lines: collapsing changes how many lines there are, and the next repaint would land on the wrong ones. So you get collapsing on committed scrollback and raw output on the live region. Short tasks may see little effect.
+**Relay mode works against Claude Code 2.1.227.** A full session capture replays to 217 screen lines with 90 of them collapsed — that capture ships in `internal/relay/testdata/` and is a default test, so a UI change upstream breaks the build rather than silently doing nothing.
+
+**What it costs.** Every frame repaints the visible region, so squint does more work than a dumb pipe. In practice that's one repaint per ~16ms of output; the emulator is the same code your terminal runs.
+
+**Known issue: flicker.** Each frame erases the live region and redraws it whole, wrapped in synchronized output (`DECSET 2026`) so the terminal only shows the finished result. Terminals that ignore 2026 show the erase, which reads as flicker on busy output. The fix is to diff against the previous frame and rewrite only the rows that changed, which removes the flicker whether or not the terminal supports 2026. Not done yet.
 
 If nothing gets collapsed at all, squint says so on exit rather than pretending to work:
 
@@ -238,15 +256,16 @@ squint: saw 412 lines and collapsed nothing — rule set "claude-code"
 may not match this agent version. Run `squint --check`.
 ```
 
-> **A warning for anyone editing rules.** Three things about this output are invisible on screen, and getting any of them wrong makes the rules match nothing — *silently*, because the display still looks fine:
+> **A warning for anyone editing rules.** Four things about this output are invisible on screen, and getting any of them wrong makes the rules match nothing — *silently*, because the display still looks fine:
 >
 > | | On screen | In the bytes |
 > |---|---|---|
 > | markers | `●` and `└` | `⏺` U+23FA and `⎿` U+23BF |
 > | line ending | a new line | `\r\r\n` (the child writes `\r\n`, then ONLCR expands the `\n`) |
 > | word spacing | spaces | no space bytes at all — `\x1b[<n>G` column jumps |
+> | a line | a line | not a thing — the screen is patched cell by cell, several rows per write |
 >
-> Capture real bytes before changing these. Every bad bug in this project was one of these three, and the unit tests stayed green each time because the fixtures were transcribed from the screen too.
+> That last one is why this project runs an emulator instead of a line filter. Capture real bytes before changing any of it; every bad bug here was one of these four, and the unit tests stayed green each time because the fixtures were transcribed from the screen too.
 
 Builds clean for darwin, linux and windows. `--relay` is Unix-only (no PTY on Windows); headless mode works everywhere.
 
