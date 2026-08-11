@@ -74,11 +74,10 @@ func (f *Filter) Judge(text string) Decision {
 		return Decision{Verdict: Drop}
 
 	case f.inBlock:
-		if strings.TrimSpace(text) == "" {
-			f.inBlock = false // 空行 = 块结束
-			return Decision{Verdict: Keep, Text: text}
-		}
-		if r.branch.MatchString(text) || strings.HasPrefix(text, "    ") {
+		// 空行**不代表块结束**：命令输出里本来就有空行（代码片段、日志段落之间）。
+		// 早先拿空行当结束标志，结果块提前收尾，后面的续行全漏出来——屏幕上就是
+		// 每个折叠行下面孤零零挂着一句 `import (`。块只由顶格正文来结束。
+		if strings.TrimSpace(text) == "" || r.branch.MatchString(text) || strings.HasPrefix(text, "    ") {
 			f.Hits++
 			return Decision{Verdict: Drop}
 		}

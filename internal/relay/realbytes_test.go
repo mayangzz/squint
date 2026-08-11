@@ -96,3 +96,43 @@ func TestRealCapture(t *testing.T) {
 		t.Errorf("屏幕上只剩 %d 行（agent 写了 %d 行），像是在吃内容而不是折叠", shown, sc.stats.Lines)
 	}
 }
+
+// TestBlankLineDoesNotEndBlock 命令输出里的空行不能被当成块结束。
+//
+// 真实抓包里的形状（脱敏后）：
+//
+//	⏺ Bash(...)
+//	  ⎿  package foo
+//	                    ← 代码片段里本来就有的空行
+//	     import (
+//	     … +88 lines (ctrl+o to expand)
+//
+// 拿空行当结束标志，块就在这里提前收尾，`import (` 原样漏出来——用户屏幕上每个
+// 折叠行下面都孤零零挂着一句代码。
+func TestBlankLineDoesNotEndBlock(t *testing.T) {
+	f := newFilter(mustRules(t), 100)
+	block := []string{
+		"⏺ Bash(sed -n 1,120p a.go)",
+		"  ⎿  package foo",
+		"",
+		"     import (",
+		"     … +88 lines (ctrl+o to expand)",
+		"",
+		"⏺ 这句是 agent 说的话，必须留下",
+	}
+	var kept []string
+	for _, l := range block {
+		if d := f.Judge(l); d.Verdict != Drop {
+			kept = append(kept, d.Text)
+		}
+	}
+	got := strings.Join(kept, "\n")
+	for _, gone := range []string{"import (", "package foo", "+88 lines"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("块里的 %q 漏出来了:\n%s", gone, got)
+		}
+	}
+	if !strings.Contains(got, "这句是 agent 说的话") {
+		t.Errorf("正文被吃了:\n%s", got)
+	}
+}

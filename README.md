@@ -247,7 +247,9 @@ MVP, and honest about it.
 
 **What it costs.** Every frame repaints the visible region, so squint does more work than a dumb pipe. In practice that's one repaint per ~16ms of output; the emulator is the same code your terminal runs.
 
-**Known issue: flicker.** Each frame erases the live region and redraws it whole, wrapped in synchronized output (`DECSET 2026`) so the terminal only shows the finished result. Terminals that ignore 2026 show the erase, which reads as flicker on busy output. The fix is to diff against the previous frame and rewrite only the rows that changed, which removes the flicker whether or not the terminal supports 2026. Not done yet.
+**Repaints are diffed.** A steady-state frame — a spinner ticking, you typing — changes one or two rows out of forty. squint rewrites only those rows; the rest are never touched, so there is nothing to flicker. A full erase-and-redraw happens only when the layout actually changes (new scrollback, different row count).
+
+**Terminal modes pass straight through.** The emulator consumes the agent's output, but some of that output is not drawing — it configures *your terminal's input*: bracketed paste (`?2004`), mouse reporting, focus events, the kitty keyboard protocol, the window title. Those are forwarded verbatim. Swallowing them silently breaks features that have nothing to do with display: image paste stops working, mouse selection dies, the title freezes. squint changes what you see, never what the terminal can do.
 
 If nothing gets collapsed at all, squint says so on exit rather than pretending to work:
 

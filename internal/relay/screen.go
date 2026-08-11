@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 
 	uv "github.com/charmbracelet/ultraviolet"
@@ -46,9 +47,12 @@ type screen struct {
 	stats    *Filter // 跨帧存活：负责已落地的历史，也用来累计自检计数
 	curVisib bool
 
-	cursorRow int    // 上一帧结束时光标停在活动区第几行，下一帧靠它退回区首
-	liveHits  int    // 最近一帧在活动区折叠掉几行
-	histRun   string // 历史里最后写出去的那串折叠行是哪个工具，用来接着并
+	cursorRow int      // 上一帧结束时光标停在活动区第几行，下一帧靠它退回区首
+	prevRows  []string // 上一帧活动区画了什么，用来只重写变了的行（见 diffLive）
+	liveHits  int      // 最近一帧在活动区折叠掉几行
+	histRun   string   // 历史里最后写出去的那串折叠行是哪个工具，用来接着并
+	forward   []byte   // 攒着要原样转给真终端的序列（见 passthrough）
+	carry     []byte   // 上一批末尾没收完的转义序列
 }
 
 func newScreen(rules *Rules, w, h int) *screen {
@@ -65,7 +69,45 @@ func newScreen(rules *Rules, w, h int) *screen {
 	return s
 }
 
-func (s *screen) Write(p []byte) { _, _ = s.em.Write(p) }
+// passthrough 是必须原样透给真终端的转义序列。
+//
+// 模拟器会把子进程的输出**整个吃掉**，只把还原出来的屏幕重画一遍。对「画什么」
+// 来说这是对的，但有一类序列压根不是在画东西——它们是在**配置终端本身的输入行为**，
+// 截在中间就等于把功能关掉了：括号粘贴没了，粘贴图片/多行就废了；鼠标上报没了，
+// 点击选中失效；窗口标题不再更新。
+//
+// 所以这里维护一份白名单原样转发。宁可漏转（顶多某个特性不生效）也不能错转
+// （光标定位类的序列转出去会把我们自己的排版打乱），所以只列输入/终端配置类。
+var passthrough = regexp.MustCompile(
+	"\x1b\\[\\?(?:9|1000|1001|1002|1003|1004|1005|1006|1015|1016|2004|2031)[hl]" + // 鼠标上报 / 括号粘贴 / 焦点上报 / 配色通知
+		"|\x1b\\[[<>=][0-9;]*u" + // kitty 键盘协议的 push/pop/query
+		"|\x1b\\[>[0-9;]*m" + // xterm modifyOtherKeys
+		"|\x1b\\]52;[^\x07\x1b]*(?:\x07|\x1b\\\\)" + // OSC 52 写系统剪贴板
+		"|\x1b\\][012];[^\x07\x1b]*(?:\x07|\x1b\\\\)") // OSC 0/1/2 窗口标题
+
+// escTail 一个转义序列最长能有多少字节。跨 read 边界被切开的序列要靠它接上。
+const escTail = 128
+
+func (s *screen) Write(p []byte) {
+	_, _ = s.em.Write(p)
+
+	// 序列可能被切在两次 read 之间，所以带上一小段上一批的尾巴一起扫。
+	buf := p
+	if len(s.carry) > 0 {
+		buf = append(append([]byte{}, s.carry...), p...)
+	}
+	for _, m := range passthrough.FindAll(buf, -1) {
+		s.forward = append(s.forward, m...)
+	}
+	s.carry = s.carry[:0]
+	if i := bytes.LastIndexByte(buf, 0x1b); i >= 0 && len(buf)-i < escTail {
+		// 末尾有个还没收尾的转义序列，留到下一批再判；已经完整匹配过的不会重复，
+		// 因为完整序列的 ESC 后面必然跟着终止字符，下一批扫不出同一个匹配。
+		if !passthrough.Match(buf[i:]) {
+			s.carry = append(s.carry, buf[i:]...)
+		}
+	}
+}
 
 // PendingHistory 有多少行滚出了屏幕、还没被取走。超过 historyFlushAt 就该马上画一帧，
 // 否则暂存区淘汰起来是无声的。
@@ -81,27 +123,96 @@ func (s *screen) Resize(w, h int) {
 // Frame 产出这一帧要写给真终端的字节。
 func (s *screen) Frame() []byte {
 	var b bytes.Buffer
+	// 配置终端输入行为的那些序列先原样发出去，跟我们画什么无关（见 passthrough）。
+	b.Write(s.forward)
+	s.forward = s.forward[:0]
+
 	b.WriteString(syncBegin)
 	b.WriteString("\x1b[?25l") // 重绘期间藏光标，否则它会在半成品上乱跳
 
-	// 退回上一帧活动区的开头，把它整片擦掉。
-	//
-	// 退多少由**上一帧光标停在第几行**决定，不是活动区有几行——收尾时光标被放回
-	// 子进程要的位置（通常是输入框，不在最后一行）。按行数退会退过头，ESC[J 就
-	// 擦掉了上面已经落地的历史：折叠得再准，屏幕也会被自己拆掉。
-	if s.cursorRow > 0 {
-		fmt.Fprintf(&b, "\x1b[%dA", s.cursorRow)
-	}
-	b.WriteString("\r\x1b[J")
+	var hist bytes.Buffer
+	s.writeHistory(&hist)
+	rows, plain, cursorRow := s.liveRegion()
+	rows, plain = trimTrailingBlank(rows, plain, cursorRow)
 
-	s.writeHistory(&b)
-	s.writeLive(&b)
+	// 只有「没有新历史、行数也没变」时才逐行比对着改。这是绝大多数帧的样子：
+	// spinner 在跳、你在打字，几十行里就变一两行。整片擦掉重画在不支持同步输出的
+	// 终端上就是肉眼可见的闪。行数变了或有新历史，位置全挪了，老老实实整片重来。
+	if hist.Len() == 0 && s.prevRows != nil && len(rows) == len(s.prevRows) {
+		s.diffLive(&b, rows, cursorRow)
+	} else {
+		s.repaintLive(&b, &hist, rows, cursorRow)
+	}
+	s.prevRows, s.cursorRow = rows, cursorRow
 
 	if s.curVisib {
 		b.WriteString("\x1b[?25h")
 	}
 	b.WriteString(syncEnd)
 	return b.Bytes()
+}
+
+// repaintLive 整片重来：退回区首擦掉，写新落地的历史，再把活动区画一遍。
+//
+// 退多少由**上一帧光标停在第几行**决定，不是活动区有几行——收尾时光标被放回
+// 子进程要的位置（通常是输入框，不在最后一行）。按行数退会退过头，ESC[J 就
+// 擦掉了上面已经落地的历史：折叠得再准，屏幕也会被自己拆掉。
+func (s *screen) repaintLive(b *bytes.Buffer, hist *bytes.Buffer, rows []string, cursorRow int) {
+	if s.cursorRow > 0 {
+		fmt.Fprintf(b, "\x1b[%dA", s.cursorRow)
+	}
+	b.WriteString("\r\x1b[J")
+	b.Write(hist.Bytes())
+	for i, row := range rows {
+		if i > 0 {
+			b.WriteString("\r\n")
+		}
+		b.WriteString(row)
+	}
+	s.placeCursor(b, len(rows)-1, cursorRow)
+}
+
+// diffLive 只重写跟上一帧不同的行，其余原样留在屏幕上。
+// 光标在行间跳着走，改一行擦一行，所以没被改的行不会有任何一瞬间是空的。
+func (s *screen) diffLive(b *bytes.Buffer, rows []string, cursorRow int) {
+	at := s.cursorRow // 光标现在在活动区第几行
+	for i, row := range rows {
+		if row == s.prevRows[i] {
+			continue
+		}
+		moveRow(b, at, i)
+		b.WriteString("\r\x1b[2K")
+		b.WriteString(row)
+		at = i
+	}
+	s.placeCursor(b, at, cursorRow)
+}
+
+// placeCursor 把光标从 from 行挪到 to 行的第 cur.X 列。
+func (s *screen) placeCursor(b *bytes.Buffer, from, to int) {
+	moveRow(b, from, to)
+	b.WriteString("\r")
+	if x := s.em.CursorPosition().X; x > 0 {
+		fmt.Fprintf(b, "\x1b[%dC", x)
+	}
+}
+
+func moveRow(b *bytes.Buffer, from, to int) {
+	switch {
+	case to < from:
+		fmt.Fprintf(b, "\x1b[%dA", from-to)
+	case to > from:
+		fmt.Fprintf(b, "\x1b[%dB", to-from)
+	}
+}
+
+// trimTrailingBlank 去掉尾部空行，但不能越过光标所在行——输入框下面通常还有几行空白。
+func trimTrailingBlank(rows, plain []string, cursorRow int) ([]string, []string) {
+	last := len(rows) - 1
+	for last > cursorRow && strings.TrimSpace(plain[last]) == "" {
+		last--
+	}
+	return rows[:last+1], plain[:last+1]
 }
 
 // writeHistory 把刚滚出屏幕的行过滤后追加出去。这部分一旦写出就不再动，
@@ -139,35 +250,6 @@ func (s *screen) writeHistory(b *bytes.Buffer) {
 	}
 	// 取空，避免下一帧重复吐同一批行；容量到顶时的淘汰也不会让我们漏行。
 	sb.Clear()
-}
-
-// writeLive 重画模拟器当前屏幕，并把光标放回子进程要的位置。
-func (s *screen) writeLive(b *bytes.Buffer) {
-	rows, plain, cursorRow := s.liveRegion()
-
-	// 去掉尾部空行，但不能越过光标所在行——输入框下面通常还有几行空白。
-	last := len(rows) - 1
-	for last > cursorRow && strings.TrimSpace(plain[last]) == "" {
-		last--
-	}
-	rows, plain = rows[:last+1], plain[:last+1]
-
-	for i, row := range rows {
-		if i > 0 {
-			b.WriteString("\r\n")
-		}
-		b.WriteString(row)
-	}
-	s.cursorRow = cursorRow
-
-	cur := s.em.CursorPosition()
-	if up := len(rows) - 1 - cursorRow; up > 0 {
-		fmt.Fprintf(b, "\x1b[%dA", up)
-	}
-	b.WriteString("\r")
-	if cur.X > 0 {
-		fmt.Fprintf(b, "\x1b[%dC", cur.X)
-	}
 }
 
 // liveRegion 过滤模拟器当前屏幕，返回渲染好的行、对应纯文本，以及光标落在第几行。
