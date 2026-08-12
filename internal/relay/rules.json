@@ -32,12 +32,13 @@
   "dedupe_repeats": true,
   "merge_tool_runs": true,
 
+  "_noise_comment": "The marker prefix is optional: Claude Code prints some status lines with the tool bullet and some without, and a pattern anchored to plain indentation silently misses half of them.",
   "noise": [
-    "^\\s*…\\s*\\+\\d+ lines",
-    "^\\s*Search(ed|ing) for \\d+ pattern",
-    "^\\s*Listed? \\d+ director",
-    "^\\s*Read \\d+ (lines|file)",
-    "^\\s*Update Todos",
-    "^\\s*Shell cwd was reset to "
+    "^\\s*[⏺●○*]?\\s*…\\s*\\+\\d+ lines",
+    "^\\s*[⏺●○*]?\\s*Search(ed|ing) for \\d+ pattern",
+    "^\\s*[⏺●○*]?\\s*Listed? \\d+ (director|item|file)",
+    "^\\s*[⏺●○*]?\\s*Read \\d+ (lines|file)",
+    "^\\s*[⏺●○*]?\\s*Update Todos",
+    "^\\s*[⏺●○*]?\\s*Shell cwd was reset to "
   ]
 }

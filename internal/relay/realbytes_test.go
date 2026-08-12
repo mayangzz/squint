@@ -78,9 +78,10 @@ func TestRealCapture(t *testing.T) {
 	if !strings.Contains(joined, "running") {
 		t.Error("折叠行没出现在用户屏幕上")
 	}
-	// 折叠对了不代表没吃东西。这几处是脱敏后依然稳定、且位置分散的锚点：
-	// 状态栏、正文里的数字、工具块提示。一旦「越擦越多」那类 bug 回来，它们会先消失。
-	for _, must := range []string{"accept edits", "114", "ctrl+o"} {
+	// 折叠对了不代表没吃东西。锚点要选**本来就该活下来**的东西：状态栏、agent 画的
+	// 表格、正文（脱敏后中文统一成「文」）。
+	// 别拿会被当噪声去掉的字样当锚点——那是在给自己立一个矛盾的验收标准。
+	for _, must := range []string{"accept edits", "┌", "文"} {
 		if !strings.Contains(joined, must) {
 			t.Errorf("屏幕上少了 %q，像是被擦掉了", must)
 		}
