@@ -33,6 +33,8 @@ type Rules struct {
 	// MergeToolRuns 连着调用同一个工具的若干次并成一行，缀上次数。
 	// 一口气跑七条 shell 命令时，七行提示不如一行「在跑 shell，第 7 条」有用。
 	MergeToolRuns *bool `json:"merge_tool_runs"`
+	// HideInputHint 抹掉输入框里光标之后的暗色文字（CC 的输入提示与历史补全）。
+	HideInputHint *bool `json:"hide_input_hint"`
 	// Tools 按工具名覆盖 HeadFormat，想写成「🔍 正在查找 {arg}」就写在这里。
 	// 键大小写不敏感，值同样支持 {tool} {arg}。
 	Tools map[string]string `json:"tools"`
@@ -44,16 +46,22 @@ type Rules struct {
 	noise  []*regexp.Regexp
 }
 
-// LoadRules 优先读 ~/.squint/rules.json，没有就用内置的那份。
+// LoadRules 优先读 $SQUINT_RULES（"builtin" 强制用内置），其次 ~/.squint/rules.json，都没有就用内置的那份。
 func LoadRules() (*Rules, error) {
 	data := defaultRules
-	if home, err := os.UserHomeDir(); err == nil {
-		path := filepath.Join(home, ".squint", "rules.json")
+	path := os.Getenv("SQUINT_RULES")
+	explicit := path != ""
+	if !explicit {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, ".squint", "rules.json")
+		}
+	}
+	if path != "" && path != "builtin" {
 		b, err := os.ReadFile(path)
 		switch {
 		case err == nil:
 			data = b
-		case !os.IsNotExist(err):
+		case explicit || !os.IsNotExist(err):
 			// 文件在但读不了（权限/是目录）——静默回退内置规则的话，用户会以为
 			// 自己的改动生效了，其实一直没读到。
 			fmt.Fprintf(os.Stderr, "squint: ignoring %s: %v\n", path, err)
@@ -81,12 +89,12 @@ func (r *Rules) compile() error {
 		return fmt.Errorf("rules.branch: %w", err)
 	}
 	if r.Head == "" || r.Branch == "" {
-		return fmt.Errorf("rules.head / rules.branch 不能为空——空正则匹配所有行，会把整个终端吃掉")
+		return fmt.Errorf("rules.head / rules.branch must not be empty: an empty regexp matches every line and would swallow the whole terminal")
 	}
 	r.noise = r.noise[:0]
 	for i, p := range r.Noise {
 		if p == "" {
-			return fmt.Errorf("rules.noise[%d] 是空串——空正则匹配所有行，会把整个终端吃掉", i)
+			return fmt.Errorf("rules.noise[%d] is empty: an empty regexp matches every line and would swallow the whole terminal", i)
 		}
 		re, err := regexp.Compile(p)
 		if err != nil {
@@ -103,6 +111,10 @@ func (r *Rules) compile() error {
 	if r.DedupeRepeats == nil {
 		on := true // 默认开：重复行没信息量
 		r.DedupeRepeats = &on
+	}
+	if r.HideInputHint == nil {
+		on := true // 提示文字跟自己敲的字挤在一行，看着像画坏了
+		r.HideInputHint = &on
 	}
 	if r.MergeToolRuns == nil {
 		on := true // 默认开：连着同一个工具，知道它在跑什么就够了

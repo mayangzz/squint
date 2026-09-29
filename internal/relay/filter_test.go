@@ -6,22 +6,22 @@ import (
 )
 
 // 素材抄自真实刷屏那一段。标记字符用 PTY 实抓到的 ⏺/⎿，不是终端里看着像的 ●/└。
-const sample = `⏺ Bash(sed -n 280,300p service/risk/chat.go; echo === ; sed -n 240,260p service/risk/chat.go; echo ===; sed -n 55,75p app/api/route/report/report.go)
+const sample = `⏺ Bash(sed -n 280,300p service/bill/calc.go; echo === ; sed -n 240,260p service/bill/calc.go; echo ===; sed -n 55,75p app/api/route/export/export.go)
   ⎿ Error: Exit code 1
             }
-        for _, logMap := range result {
-                if isSameMsgInfo(msg, logMap) {
-                        msg.OriginalMsg = logMap["content"]
+        for _, record := range result {
+                if isSameInvoice(inv, record) {
+                        inv.OriginalAmount = record["amount"]
     … +13 lines (ctrl+o to expand)
 
   Searched for 1 pattern (ctrl+o to expand)
 
-⏺ Bash(sed -n 220,300p service/risk/chat.go)
+⏺ Bash(sed -n 220,300p service/bill/calc.go)
   ⎿   }
     … +78 lines (ctrl+o to expand)
-  Shell cwd was reset to /Users/wepie/local/golangProject/wespy-http-go
+  Shell cwd was reset to /Users/you/src/shop-api
 
-⏺ 策略 114 = CensorStrategyUserCheck「个人资料先审后发」（昵称 / 头像 / 签名改动）
+⏺ 策略 114 = BillStrategyRetryCheck「扣款失败先重试后退款」（超时 / 限流 / 余额不足）
 一、什么时候建 114`
 
 func TestFilterCollapsesToolBlocks(t *testing.T) {
@@ -37,7 +37,7 @@ func TestFilterCollapsesToolBlocks(t *testing.T) {
 	// 该消失的
 	for _, gone := range []string{
 		"+13 lines", "+78 lines", "Searched for 1 pattern",
-		"Shell cwd was reset", "isSameMsgInfo", "Error: Exit code 1",
+		"Shell cwd was reset", "isSameInvoice", "Error: Exit code 1",
 	} {
 		if strings.Contains(got, gone) {
 			t.Errorf("这行本该被折叠掉，却还在输出里: %q\n---\n%s", gone, got)
@@ -51,7 +51,7 @@ func TestFilterCollapsesToolBlocks(t *testing.T) {
 		}
 	}
 	// 长命令必须被截断，不能整条铺出来
-	if strings.Contains(got, "app/api/route/report/report.go") {
+	if strings.Contains(got, "app/api/route/export/export.go") {
 		t.Errorf("头行没截断:\n%s", got)
 	}
 	t.Logf("过滤后（%d 行 → %d 行）:\n%s", len(strings.Split(sample, "\n")), len(out), got)
@@ -135,8 +135,8 @@ func TestHeadDoesNotEatProse(t *testing.T) {
 	f := newFilter(mustRules(t), 100)
 	prose := []string{
 		"⏺ Now I will check (the config) before moving on",
-		"⏺ 策略 114 = CensorStrategyUserCheck（个人资料先审后发）",
-		"⏺ done — see service/censor/payload.go:44 (line 44)",
+		"⏺ 策略 114 = BillStrategyRetryCheck（扣款失败先重试后退款）",
+		"⏺ done — see service/bill/payload.go:44 (line 44)",
 		"⏺ 这里有个坑(注意)",
 	}
 	for _, p := range prose {
@@ -149,5 +149,23 @@ func TestHeadDoesNotEatProse(t *testing.T) {
 		if d := f.Judge(tool); d.Verdict != Collapse {
 			t.Errorf("没认出工具调用: %q", tool)
 		}
+	}
+}
+
+// 2.1.284 自己把 ls/grep/读文件归成一行「Listing 1 directory…」，下面挂着真实命令，两行都该收掉。
+func TestNativeGroupedStepsDropped(t *testing.T) {
+	f := newFilter(mustRules(t), 100)
+	for _, l := range []string{
+		"● Listing 1 directory… (ctrl+o to expand)",
+		"  ⎿  $ ls -laR internal",
+		"  Reading 3 files… (ctrl+o to expand)",
+		"  Searched for 4 patterns (ctrl+o to expand)",
+	} {
+		if d := f.Judge(l); d.Verdict != Drop {
+			t.Errorf("should drop %q, got %v %q", l, d.Verdict, d.Text)
+		}
+	}
+	if d := f.Judge("● All four commands ran cleanly."); d.Verdict != Keep {
+		t.Errorf("agent reply after a grouped step must survive, got %v", d.Verdict)
 	}
 }

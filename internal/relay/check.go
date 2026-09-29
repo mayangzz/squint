@@ -19,9 +19,9 @@ import (
 //
 // 这个项目最严重的几个 bug 全出在这三点上，而单测每次都是绿的，因为素材和代码
 // 犯了同一个错。改这里之前先抓一份真字节（SQUINT_CAPTURE=/tmp/x.raw）。
-const sampleTUI = "\x1b[2G\x1b[92m⏺\x1b[39m\x1b[4G\x1b[1mBash\x1b[22m(sed -n 280,300p service/risk/chat.go; echo === ; sed -n 55,75p report.go)\r\r\n" +
+const sampleTUI = "\x1b[2G\x1b[92m⏺\x1b[39m\x1b[4G\x1b[1mBash\x1b[22m(sed -n 280,300p service/bill/calc.go; echo === ; sed -n 55,75p report.go)\r\r\n" +
 	"\x1b[2G\x1b[2m⎿\x1b[22m\x1b[6GError: Exit code 1\r\r\n" +
-	"\x1b[6Gfor _, logMap := range result {\r\r\n" +
+	"\x1b[6Gfor _, record := range result {\r\r\n" +
 	"\x1b[4G\x1b[2m… +13 lines (ctrl+o to expand)\x1b[22m\r\r\n" +
 	"\r\r\n" +
 	"\x1b[4GSearched for 1 pattern (ctrl+o to expand)\r\r\n" +

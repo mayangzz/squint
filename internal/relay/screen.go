@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"fmt"
+	"image/color"
 	"regexp"
 	"strings"
 
@@ -27,6 +28,11 @@ const (
 	historyFlushAt   = 1024
 )
 
+// ponytail: 差量重绘一旦跟真终端错位（宽字符宽度判定分歧、外部程序插了几行…），
+// 差下去只会越错越多。每这么多帧强制整片重画一次当保险丝——同步输出下看不见，
+// 最坏也就烂几百毫秒自己就好了。真找到错位根因可以调大。
+const maxDiffRun = 120
+
 // screen 把子进程的输出喂进终端模拟器，再按规则重新渲染一份「过滤后的屏幕」。
 //
 // 为什么非要模拟器：Claude Code 2.1.227 是差量重绘——ESC[nA 上跳、CR ESC[1B 逐格补画，
@@ -49,10 +55,13 @@ type screen struct {
 
 	cursorRow int      // 上一帧结束时光标停在活动区第几行，下一帧靠它退回区首
 	prevRows  []string // 上一帧活动区画了什么，用来只重写变了的行（见 diffLive）
+	diffRun   int      // 连着走了几帧差量重绘，到 maxDiffRun 强制整片重画一次（自愈）
+	pending   bool     // 打字期间欠下的整片重画，停手后要补上
 	liveHits  int      // 最近一帧在活动区折叠掉几行
 	histRun   string   // 历史里最后写出去的那串折叠行是哪个工具，用来接着并
 	forward   []byte   // 攒着要原样转给真终端的序列（见 passthrough）
 	carry     []byte   // 上一批末尾没收完的转义序列
+	oscHold   []byte   // 还没收尾的 OSC，攒齐了再喂模拟器
 }
 
 func newScreen(rules *Rules, w, h int) *screen {
@@ -88,8 +97,24 @@ var passthrough = regexp.MustCompile(
 // escTail 一个转义序列最长能有多少字节。跨 read 边界被切开的序列要靠它接上。
 const escTail = 128
 
+// oscStrip 是不喂给模拟器的 OSC：模拟器解析 OSC 时遇到非 ASCII（标题里的 ✳）会中断，把标题文字画到屏幕上。
+var oscStrip = regexp.MustCompile("\x1b\\](?:[012]|52);[^\x07\x1b]*(?:\x07|\x1b\\\\)")
+
+// oscHoldMax 超过这个长度还没收尾的 OSC 不再等，直接放行。
+const oscHoldMax = 4096
+
 func (s *screen) Write(p []byte) {
-	_, _ = s.em.Write(p)
+	feed := p
+	if len(s.oscHold) > 0 {
+		feed = append(s.oscHold, p...)
+		s.oscHold = nil
+	}
+	if i := bytes.LastIndex(feed, []byte("\x1b]")); i >= 0 && len(feed)-i < oscHoldMax &&
+		bytes.IndexByte(feed[i:], 0x07) < 0 && !bytes.Contains(feed[i:], []byte("\x1b\\")) {
+		s.oscHold = append([]byte{}, feed[i:]...)
+		feed = feed[:i]
+	}
+	_, _ = s.em.Write(oscStrip.ReplaceAll(feed, nil))
 
 	// 序列可能被切在两次 read 之间，所以带上一小段上一批的尾巴一起扫。
 	buf := p
@@ -118,10 +143,31 @@ func (s *screen) Resize(w, h int) {
 	s.stats.width = w
 	// 终端自己会重排，退回去擦只会擦错地方；清掉退行量，下一帧从当前位置重新开始。
 	s.cursorRow = 0
+	// 上一帧那些行是按旧宽度排的。留着它做差量比对，「内容没变」的行会被跳过，
+	// 可它们在终端里已经被重排到别处了 —— 新旧两版就叠在一起（宽表格最明显）。
+	// 丢掉，逼下一帧整片重画。
+	s.prevRows = nil
 }
 
 // Frame 产出这一帧要写给真终端的字节。
-func (s *screen) Frame() []byte {
+func (s *screen) Frame() []byte { return s.frame(false) }
+
+// FrameDeferRepaint 同 Frame，但这一帧若需要整片重画就直接跳过（返回 nil）。
+//
+// 用在用户正在打字的时候：中文输入法的预编辑是终端自己画的、不经过 PTY，模拟器看不见它，
+// 整片重画（\x1b[J）会连它一起擦掉 —— 屏幕上就出现「方案方案」这种一份已上屏、
+// 一份是被打乱的预编辑。数据照常进模拟器，只是晚几十毫秒再画，spinner 慢一拍没人在意。
+func (s *screen) FrameDeferRepaint() []byte { return s.frame(true) }
+
+func (s *screen) frame(deferRepaint bool) []byte {
+	// 推迟要在取历史、清 forward 之前判：writeHistory 会清空滚动缓冲，判晚了新历史就丢了。
+	if deferRepaint && !s.canDiffNow() {
+		s.pending = true // 这帧欠着，等用户停手再画
+		out := append([]byte(nil), s.forward...)
+		s.forward = s.forward[:0]
+		return out // 输入模式序列跟重画无关，照发
+	}
+
 	var b bytes.Buffer
 	// 配置终端输入行为的那些序列先原样发出去，跟我们画什么无关（见 passthrough）。
 	b.Write(s.forward)
@@ -129,6 +175,9 @@ func (s *screen) Frame() []byte {
 
 	b.WriteString(syncBegin)
 	b.WriteString("\x1b[?25l") // 重绘期间藏光标，否则它会在半成品上乱跳
+	// 关掉自动折行：只要有一行的实际宽度跟我们算的差一格，终端就会把它折成两行，
+	// 活动区随即多占一行，而退行量是按行数算的——从此每帧都擦错地方，屏幕就串了。
+	b.WriteString("\x1b[?7l")
 
 	var hist bytes.Buffer
 	s.writeHistory(&hist)
@@ -138,18 +187,33 @@ func (s *screen) Frame() []byte {
 	// 只有「没有新历史、行数也没变」时才逐行比对着改。这是绝大多数帧的样子：
 	// spinner 在跳、你在打字，几十行里就变一两行。整片擦掉重画在不支持同步输出的
 	// 终端上就是肉眼可见的闪。行数变了或有新历史，位置全挪了，老老实实整片重来。
-	if hist.Len() == 0 && s.prevRows != nil && len(rows) == len(s.prevRows) {
+	canDiff := hist.Len() == 0 && s.prevRows != nil && len(rows) == len(s.prevRows) && s.diffRun < maxDiffRun
+	s.pending = false
+	if canDiff {
 		s.diffLive(&b, rows, cursorRow)
+		s.diffRun++
 	} else {
 		s.repaintLive(&b, &hist, rows, cursorRow)
+		s.diffRun = 0
 	}
 	s.prevRows, s.cursorRow = rows, cursorRow
 
 	if s.curVisib {
 		b.WriteString("\x1b[?25h")
 	}
+	b.WriteString("\x1b[?7h")
 	b.WriteString(syncEnd)
 	return b.Bytes()
+}
+
+// canDiffNow 不动任何状态地预判这帧能否只做差量；有待取的滚出行就一定得整片重画。
+func (s *screen) canDiffNow() bool {
+	if s.PendingHistory() > 0 || s.prevRows == nil || s.diffRun >= maxDiffRun {
+		return false
+	}
+	rows, plain, cursorRow := s.liveRegion()
+	rows, _ = trimTrailingBlank(rows, plain, cursorRow)
+	return len(rows) == len(s.prevRows)
 }
 
 // repaintLive 整片重来：退回区首擦掉，写新落地的历史，再把活动区画一遍。
@@ -269,6 +333,9 @@ func (s *screen) liveRegion() (rows, plain []string, cursorRow int) {
 
 	for y := 0; y < s.em.Height(); y++ {
 		line := s.lineAt(y)
+		if y == cur.Y && *s.rules.HideInputHint {
+			dropHintAfter(line, cur.X)
+		}
 		text := lineText(line)
 		d := Decision{Verdict: Keep, Text: text}
 		if !alt {
@@ -306,6 +373,9 @@ func (s *screen) liveRegion() (rows, plain []string, cursorRow int) {
 	return rows, plain, cursorRow
 }
 
+// Pending 打字期间是否欠着一帧没画。
+func (s *screen) Pending() bool { return s.pending }
+
 // Collapses 返回一共折叠掉多少行。
 //
 // 历史那份是累计的；活动区每帧整片重判，只能取最近一帧——但短会话里工具块很可能
@@ -318,6 +388,70 @@ func (s *screen) HealthWarning() string {
 		return ""
 	}
 	return s.stats.HealthWarning()
+}
+
+// dropHintAfter 抹掉输入行里的提示文字（CC 的输入占位与历史补全）。
+//
+// 两处比原来宽：① 提示不一定是 SGR 2，也可能只给个灰前景色；② 收尾时光标未必停在
+// 敲的字尾，按光标列切会整条漏掉。所以输入行改成「自己敲的最后一个字之后的暗色/灰字」
+// 一律抹掉——敲的字是默认色，@提及和斜杠命令是彩色（非灰），都不会误伤。
+// 正文行仍只按光标列抹暗色，免得把彩色输出擦了。
+func dropHintAfter(line uv.Line, x int) {
+	input := isInputRow(line)
+	if input {
+		x = lastTypedIdx(line) + 1
+	}
+	for i := x; i < len(line); i++ {
+		c := line[i]
+		hint := c.Style.Attrs&uv.AttrFaint != 0 || (input && isHintCell(c))
+		if hint && !isBoxDrawing(c.Content) {
+			line[i] = uv.Cell{Content: " ", Width: 1}
+		}
+	}
+}
+
+// isInputRow 判断这行是不是 CC 的输入行（提示符 ❯ / > 打头）。
+func isInputRow(line uv.Line) bool {
+	t := strings.TrimLeft(lineText(line), " \u00a0")
+	return strings.HasPrefix(t, "❯") || strings.HasPrefix(t, "> ")
+}
+
+// isHintCell 暗色或灰前景的格子算提示。只认灰：彩色是 @提及 / 斜杠命令这类自己敲的东西。
+func isHintCell(c uv.Cell) bool {
+	return c.Style.Attrs&uv.AttrFaint != 0 || isGray(c.Style.Fg)
+}
+
+// isGray 三通道接近相等即算灰。CC 的输入提示 / 历史补全一律不想看到，所以宁可判宽些：
+// 偏亮的灰（#c8c8c8 这种）也算，只把接近纯白的排除掉——自己敲的字是默认色（Fg 为 nil），
+// @提及和斜杠命令是彩色（三通道差得远），都不会被误伤。
+func isGray(c color.Color) bool {
+	if c == nil {
+		return false
+	}
+	r, g, b, _ := c.RGBA()
+	r, g, b = r>>8, g>>8, b>>8
+	hi, lo := max(r, max(g, b)), min(r, min(g, b))
+	return hi-lo <= 32 && hi < 0xf0
+}
+
+// lastTypedIdx 一行里最后一个「自己敲的非空字符」在第几列，没有则 -1。
+func lastTypedIdx(line uv.Line) int {
+	last := -1
+	for i, c := range line {
+		if !isHintCell(c) && strings.TrimSpace(c.Content) != "" {
+			last = i
+		}
+	}
+	return last
+}
+
+// isBoxDrawing 框线字符不能当提示抹掉，否则输入框会缺一角。
+func isBoxDrawing(s string) bool {
+	if s == "" {
+		return false
+	}
+	r := []rune(s)[0]
+	return r >= 0x2500 && r <= 0x257f
 }
 
 func (s *screen) lineAt(y int) uv.Line {

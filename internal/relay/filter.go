@@ -8,6 +8,8 @@ package relay
 
 import (
 	"strings"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -60,7 +62,7 @@ func (f *Filter) Judge(text string) Decision {
 		f.inBlock = true
 		f.Hits++
 		tool, arg := f.parseHead(text)
-		line := dim + r.formatHead(tool, arg) + reset
+		line := f.clamp(dim + r.formatHead(tool, arg) + reset)
 		// 连着重复的同一行压掉：agent 反复读同一个文件、反复跑同一条命令是常态，
 		// 第二次开始就没有新信息了，只是占屏幕。
 		if *r.DedupeRepeats && line == f.lastHead {
@@ -70,6 +72,8 @@ func (f *Filter) Judge(text string) Decision {
 		return Decision{Verdict: Collapse, Text: line, Tool: tool, Arg: arg}
 
 	case r.isNoise(text):
+		// 2.1.284 的「Listing 1 directory…」下面还挂着一行 `⎿ $ ls …`，要跟着一起收掉。
+		f.inBlock = true
 		f.Hits++
 		return Decision{Verdict: Drop}
 
@@ -115,7 +119,17 @@ func (f *Filter) runLine(tool, arg string, n int) string {
 	if n > 1 {
 		line += " ×" + itoa(n)
 	}
-	return dim + line + reset
+	return f.clamp(dim + line + reset)
+}
+
+// clamp 把折叠行截进终端宽度。折叠行是我们自己拼的（图标 + 中文 + 参数 + 次数），
+// parseHead 那点按字节算的余量根本兜不住，宽出去一格真终端就会折行——活动区
+// 因此多占一行，而上层的退行量是按行数算的，从此每帧都擦错地方，屏幕就串了。
+func (f *Filter) clamp(line string) string {
+	if f.width <= 0 || ansi.StringWidth(line) <= f.width {
+		return line
+	}
+	return ansi.Truncate(line, f.width-1, "…") + reset
 }
 
 // minLinesForHealthCheck 少于这么多行就不下结论——可能只是开了一下就退出了。

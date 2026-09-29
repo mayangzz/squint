@@ -137,3 +137,28 @@ func TestBlankLineDoesNotEndBlock(t *testing.T) {
 		t.Errorf("正文被吃了:\n%s", got)
 	}
 }
+
+// TestRealCapture2_1_284 是 2.1.284 的抓包（/tmp 下的演示仓库录的，本来就没有私有内容）。
+// 这版起启动横幅前带 ST 结尾的窗口标题，ls/grep 被 CC 自己归成「Listing 1 directory…」。
+func TestRealCapture2_1_284(t *testing.T) {
+	data, err := os.ReadFile("testdata/cc-2.1.284.raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible, sc := replay(mustRules(t), data)
+	joined := strings.Join(visible, "\n")
+	if sc.stats.Hits == 0 || !strings.Contains(joined, "running") {
+		t.Fatal("rules no longer match the 2.1.284 UI")
+	}
+	for _, gone := range []string{"Listing 1 directory", "$ ls -laR", "Allowed by auto mode classifier", "(No output)"} {
+		if strings.Contains(joined, gone) {
+			t.Errorf("%q should have been folded", gone)
+		}
+	}
+	for _, l := range visible {
+		if strings.Count(l, "Claude") > 1 && strings.Contains(l, "v2.1.284") {
+			t.Errorf("window title painted into the banner: %q", l)
+		}
+	}
+	t.Logf("\n%s", joined)
+}

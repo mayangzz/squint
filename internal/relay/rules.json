@@ -36,8 +36,8 @@
   "noise": [
     "^\\s*[⏺●○*]?\\s*…\\s*\\+\\d+ lines",
     "^\\s*[⏺●○*]?\\s*Search(ed|ing) for \\d+ pattern",
-    "^\\s*[⏺●○*]?\\s*Listed? \\d+ (director|item|file)",
-    "^\\s*[⏺●○*]?\\s*Read \\d+ (lines|file)",
+    "^\\s*[⏺●○*]?\\s*List(ed|ing)? \\d+ (director|item|file)",
+    "^\\s*[⏺●○*]?\\s*Read(ing)? \\d+ (lines|file)",
     "^\\s*[⏺●○*]?\\s*Update Todos",
     "^\\s*[⏺●○*]?\\s*Shell cwd was reset to "
   ]

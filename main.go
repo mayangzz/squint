@@ -20,6 +20,9 @@ import (
 	"github.com/mayangzz/squint/internal/source"
 )
 
+// version 由 goreleaser 在发布时通过 -ldflags 注入。
+var version = "dev"
+
 // exitCode 由 run 结束时的 os.Exit 消费；不能在中途 os.Exit，否则 --save 的 defer Close 不跑。
 var exitCode int
 
@@ -35,7 +38,19 @@ func main() {
 	)
 	relayMode := flag.Bool("relay", false, "relay mode: run the interactive agent in a PTY and collapse its tool blocks")
 	check := flag.Bool("check", false, "self-check the collapse rules against a real sample")
+	stale := flag.Bool("stale", false, "list windows still running an older squint binary (reopen those)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("squint", version)
+		return
+	}
+
+	if *stale {
+		fmt.Print(relay.StaleReport())
+		return
+	}
 
 	if *check {
 		// `squint --check <capture>` 重放一份真实抓包；不给文件就拿内置样本自检。

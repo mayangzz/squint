@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/charmbracelet/ultraviolet v0.0.0-20260810092200-402eeaa30986
+	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/charmbracelet/x/vt v0.0.0-20260811123453-c2cf5732786f
 	github.com/creack/pty v1.1.24
 	golang.org/x/term v0.28.0
@@ -11,7 +12,6 @@ require (
 
 require (
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
-	github.com/charmbracelet/x/ansi v0.11.7 // indirect
 	github.com/charmbracelet/x/exp/ordered v0.1.0 // indirect
 	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect
